@@ -3,12 +3,10 @@ name: Release
 on:
   push:
     branches: [main]
-    tags: ["v*"]
 
 jobs:
   semantic-release:
     name: Semantic release
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -23,19 +21,3 @@ jobs:
       - uses: cycjimmy/semantic-release-action@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  compile:
-    name: Compile binaries
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: cli/gh-extension-precompile@v2
-        with:
-          generate_attestations: true
-          go_version_file: go.mod

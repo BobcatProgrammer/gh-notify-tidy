@@ -1,0 +1,21 @@
+name: Compile
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  compile:
+    name: Compile binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cli/gh-extension-precompile@v2
+        with:
+          generate_attestations: true
+          go_version_file: go.mod
