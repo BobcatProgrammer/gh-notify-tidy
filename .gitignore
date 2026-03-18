@@ -1,0 +1,22 @@
+# Binaries
+/gh-notify-tidy
+/gh-notify-tidy.exe
+dist/
+
+# Go
+*.test
+*.out
+coverage.txt
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pre-commit cache
+.pre-commit-cache/
