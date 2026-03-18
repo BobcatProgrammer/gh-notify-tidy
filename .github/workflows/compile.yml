@@ -3,6 +3,12 @@ name: Compile
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.0.1)"
+        required: true
+        type: string
 
 jobs:
   compile:
@@ -14,8 +20,12 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
 
       - uses: cli/gh-extension-precompile@v2
         with:
           generate_attestations: true
           go_version_file: go.mod
+          release_tag: ${{ inputs.tag || github.ref_name }}
