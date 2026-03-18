@@ -10,20 +10,21 @@ import (
 	"github.com/BobcatProgrammer/gh-notify-tidy/internal/tui"
 )
 
-var interactiveOldDays int
-
 var interactiveCmd = &cobra.Command{
 	Use:     "interactive",
 	Aliases: []string{"i"},
 	Short:   "Interactive guided notification cleanup (TUI)",
-	Long: `Walk through your notifications step-by-step in a Bubble Tea TUI.
+	Long: `Walk through your stale notifications in a Bubble Tea TUI.
+
+The tool fetches all notifications, checks which ones no longer require
+action (merged/closed PRs, approved PRs, closed issues), then presents
+them grouped by repository and reason for you to bulk-triage.
 
 Steps:
-  1. Statistics — per-repo breakdown with suggestions
-  2. Old notifications — triage notifications older than N days
-  3. Closed/merged PR notifications — triage read PR threads
-  4. Already-read notifications — triage all other read threads
-  5. Confirm — review and apply selected actions
+  1. Loading + staleness check
+  2. Statistics overview
+  3. Stale notification groups — mark each group as done/read/mute/skip
+  4. Confirm — review and apply selected actions
 
 Keys: r=read  d=done  m=mute  s=skip  enter/n=next step  q=quit`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -37,7 +38,7 @@ Keys: r=read  d=done  m=mute  s=skip  enter/n=next step  q=quit`,
 			Org:  flagOrg,
 		}
 
-		model := tui.New(client, filter, flagDryRun, interactiveOldDays)
+		model := tui.New(client, filter, flagDryRun)
 
 		p := tea.NewProgram(model, tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
@@ -49,7 +50,5 @@ Keys: r=read  d=done  m=mute  s=skip  enter/n=next step  q=quit`,
 }
 
 func init() {
-	interactiveCmd.Flags().IntVar(&interactiveOldDays, "old-days", 30,
-		"notifications older than this many days are shown in the 'old' step")
 	rootCmd.AddCommand(interactiveCmd)
 }
