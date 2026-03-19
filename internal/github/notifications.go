@@ -36,6 +36,24 @@ type PullRequest struct {
 	Merged bool   `json:"merged"`
 }
 
+// Issue holds the fields we need when checking issue state.
+type Issue struct {
+	State string `json:"state"` // "open" | "closed"
+}
+
+// PRReview holds the fields we need from a pull request review.
+type PRReview struct {
+	State string `json:"state"` // "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "PENDING", "DISMISSED"
+	User  struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// AuthenticatedUser holds the login of the currently authenticated user.
+type AuthenticatedUser struct {
+	Login string `json:"login"`
+}
+
 // ListAll fetches all notifications (read + unread) and applies the filter.
 func (c *Client) ListAll(f Filter) ([]Thread, error) {
 	var all []Thread
@@ -139,6 +157,43 @@ func (c *Client) GetPR(subjectURL string) (PullRequest, error) {
 	}
 
 	return pr, nil
+}
+
+// GetPRReviews fetches all reviews for a pull request.
+// subjectURL is the API URL from Thread.Subject.URL (the PR URL).
+func (c *Client) GetPRReviews(subjectURL string) ([]PRReview, error) {
+	path := stripAPIBase(subjectURL) + "/reviews"
+
+	var reviews []PRReview
+	if err := c.rest.Get(path, &reviews); err != nil {
+		return nil, fmt.Errorf("get PR reviews %s: %w", path, err)
+	}
+
+	return reviews, nil
+}
+
+// GetIssue fetches an issue's state.
+// subjectURL is the API URL from Thread.Subject.URL,
+// e.g. https://api.github.com/repos/owner/repo/issues/123
+func (c *Client) GetIssue(subjectURL string) (Issue, error) {
+	path := stripAPIBase(subjectURL)
+
+	var issue Issue
+	if err := c.rest.Get(path, &issue); err != nil {
+		return Issue{}, fmt.Errorf("get issue %s: %w", path, err)
+	}
+
+	return issue, nil
+}
+
+// GetAuthenticatedUser returns the login of the currently authenticated user.
+func (c *Client) GetAuthenticatedUser() (string, error) {
+	var user AuthenticatedUser
+	if err := c.rest.Get("user", &user); err != nil {
+		return "", fmt.Errorf("get authenticated user: %w", err)
+	}
+
+	return user.Login, nil
 }
 
 // stripAPIBase removes the scheme+host prefix so the path is relative to the

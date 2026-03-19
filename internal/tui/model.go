@@ -17,17 +17,15 @@ import (
 type Step int
 
 const (
-	StepLoading   Step = iota // fetching notifications
-	StepStats                 // show stats / worst offenders
-	StepOld                   // old notifications (>N days)
-	StepClosedPRs             // notifications for closed/merged PRs
-	StepReadDone              // already-read notifications
-	StepConfirm               // review pending actions
-	StepApplying              // applying actions
-	StepDone                  // finished
+	StepLoading     Step = iota // fetching + checking staleness
+	StepStats                   // show stats / overview
+	StepBatchGroups             // triage stale groups
+	StepConfirm                 // review pending actions
+	StepApplying                // applying actions
+	StepDone                    // finished
 )
 
-// Action the user chose for a notification.
+// Action the user chose for a group of notifications.
 type Action int
 
 const (
@@ -53,31 +51,38 @@ func (a Action) String() string {
 	}
 }
 
-// notifItem wraps a Thread for display in a bubbles/list.
-type notifItem struct {
-	thread gh.Thread
+// groupItem wraps a StaleGroup for display in the batch-groups list.
+type groupItem struct {
+	group  gh.StaleGroup
 	action Action
 }
 
-func (i notifItem) Title() string {
-	return fmt.Sprintf("[%s] %s", i.thread.Repository.FullName, i.thread.Subject.Title)
+func (i groupItem) Title() string {
+	return fmt.Sprintf("%s  ·  %s  (%d)",
+		i.group.Repo, string(i.group.StaleReason), len(i.group.Threads))
 }
 
-func (i notifItem) Description() string {
-	reason := i.thread.Reason
-	typ := i.thread.Subject.Type
-	age := humanAge(i.thread.UpdatedAt)
+func (i groupItem) Description() string {
+	titles := make([]string, 0, 3)
+	for j, t := range i.group.Threads {
+		if j >= 3 {
+			titles = append(titles, fmt.Sprintf("… and %d more", len(i.group.Threads)-3))
+			break
+		}
+
+		titles = append(titles, truncate(t.Subject.Title, 60))
+	}
 
 	action := ""
 	if i.action != ActionNone {
-		action = " → " + strings.ToUpper(i.action.String())
+		action = "  →  " + strings.ToUpper(i.action.String())
 	}
 
-	return fmt.Sprintf("%s · %s · %s%s", typ, reason, age, action)
+	return strings.Join(titles, "  |  ") + action
 }
 
-func (i notifItem) FilterValue() string {
-	return i.thread.Repository.FullName + " " + i.thread.Subject.Title
+func (i groupItem) FilterValue() string {
+	return i.group.Repo + " " + string(i.group.StaleReason)
 }
 
 // pendingAction pairs a thread with the chosen action for the confirm step.
@@ -86,11 +91,20 @@ type pendingAction struct {
 	action Action
 }
 
+// -- Messages
+
 // loadedMsg is sent when the initial notification fetch completes.
 type loadedMsg struct {
-	threads []gh.Thread
-	stats   []gh.Stats
-	err     error
+	threads     []gh.Thread
+	stats       []gh.Stats
+	viewerLogin string
+	err         error
+}
+
+// staleCheckedMsg is sent when the staleness pass completes.
+type staleCheckedMsg struct {
+	groups []gh.StaleGroup
+	err    error
 }
 
 // appliedMsg is sent when all actions have been applied.
@@ -101,58 +115,50 @@ type appliedMsg struct {
 	errs  []error
 }
 
-// progressMsg is sent after each individual action during apply.
-type progressMsg struct {
-	threadID string
-	action   Action
-	err      error
-}
-
 // Model is the root Bubble Tea model for the interactive flow.
 type Model struct {
-	client  *gh.Client
-	filter  gh.Filter
-	dryRun  bool
-	oldDays int
+	client *gh.Client
+	filter gh.Filter
+	dryRun bool
 
 	step    Step
 	spinner spinner.Model
 
+	loadingLabel string
+
 	// Data
 	allThreads  []gh.Thread
 	stats       []gh.Stats
-	oldThreads  []gh.Thread
-	closedPRs   []gh.Thread
-	readThreads []gh.Thread
+	viewerLogin string
+	groups      []gh.StaleGroup
 
-	// Per-step list widgets
+	// Per-step list widget
 	list list.Model
 
-	// Actions decided per thread (threadID → Action)
-	decisions map[string]Action
+	// Actions decided per group index (groupIdx → Action)
+	groupActions map[int]Action
 
 	// Confirm/apply state
-	pending  []pendingAction
-	progress []string
-	applied  appliedMsg
+	pending []pendingAction
+	applied appliedMsg
 
 	width  int
 	height int
 }
 
 // New creates a new interactive Model.
-func New(client *gh.Client, filter gh.Filter, dryRun bool, oldDays int) Model {
+func New(client *gh.Client, filter gh.Filter, dryRun bool) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 
 	return Model{
-		client:    client,
-		filter:    filter,
-		dryRun:    dryRun,
-		oldDays:   oldDays,
-		step:      StepLoading,
-		spinner:   s,
-		decisions: make(map[string]Action),
+		client:       client,
+		filter:       filter,
+		dryRun:       dryRun,
+		step:         StepLoading,
+		spinner:      s,
+		loadingLabel: "Loading notifications…",
+		groupActions: make(map[int]Action),
 	}
 }
 
@@ -176,38 +182,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case loadedMsg:
 		if msg.err != nil {
-			// Surface error and quit gracefully.
 			return m, tea.Quit
 		}
 
 		m.allThreads = msg.threads
 		m.stats = msg.stats
-		m.oldThreads = filterOld(msg.threads, m.oldDays)
-		m.closedPRs = filterClosedPRs(msg.threads)
-		m.readThreads = filterRead(msg.threads)
-		m.step = StepStats
-		return m, nil
+		m.viewerLogin = msg.viewerLogin
+		m.loadingLabel = fmt.Sprintf("Checking %d notification(s) for staleness…", len(msg.threads))
+		return m, m.checkStale()
 
-	case progressMsg:
-		status := fmt.Sprintf("  %s → %s", msg.threadID, msg.action)
+	case staleCheckedMsg:
 		if msg.err != nil {
-			status += fmt.Sprintf(" ERROR: %v", msg.err)
+			return m, tea.Quit
 		}
 
-		m.progress = append(m.progress, status)
+		m.groups = msg.groups
+		m.step = StepStats
 		return m, nil
 
 	case appliedMsg:
 		m.applied = msg
 		m.step = StepDone
 		return m, nil
-
-	case list.Model:
-		m.list = msg
 	}
 
-	// Delegate list updates when in a list step.
-	if m.inListStep() {
+	// Delegate list updates when in the groups step.
+	if m.step == StepBatchGroups {
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
 		return m, cmd
@@ -219,13 +219,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	switch m.step {
 	case StepLoading:
-		return fmt.Sprintf("\n  %s Loading notifications…\n", m.spinner.View())
+		return fmt.Sprintf("\n  %s %s\n", m.spinner.View(), m.loadingLabel)
 
 	case StepStats:
 		return m.viewStats()
 
-	case StepOld, StepClosedPRs, StepReadDone:
-		return m.viewList()
+	case StepBatchGroups:
+		return m.viewBatchGroups()
 
 	case StepConfirm:
 		return m.viewConfirm()
@@ -240,7 +240,7 @@ func (m Model) View() string {
 	return ""
 }
 
-// ── Key handling ────────────────────────────────────────────────────────────
+// -- Key handling
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -251,8 +251,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.step {
 	case StepStats:
 		return m.handleStatsKey(msg)
-	case StepOld, StepClosedPRs, StepReadDone:
-		return m.handleListKey(msg)
+	case StepBatchGroups:
+		return m.handleGroupsKey(msg)
 	case StepConfirm:
 		return m.handleConfirmKey(msg)
 	}
@@ -263,25 +263,26 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleStatsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter", "n", " ":
-		return m.enterStep(StepOld)
+		return m.enterBatchGroups(), nil
 	}
 
 	return m, nil
 }
 
-func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleGroupsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "r":
-		return m.setCurrentAction(ActionRead)
+		return m.setGroupAction(ActionRead), nil
 	case "d":
-		return m.setCurrentAction(ActionDone)
+		return m.setGroupAction(ActionDone), nil
 	case "m":
-		return m.setCurrentAction(ActionMute)
+		return m.setGroupAction(ActionMute), nil
 	case "s", " ":
-		return m.setCurrentAction(ActionSkip)
+		return m.setGroupAction(ActionSkip), nil
 	case "enter", "n":
-		// Advance to next step or confirm.
-		return m.advanceStep()
+		m.pending = m.buildPending()
+		m.step = StepConfirm
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -302,93 +303,71 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── Step transitions ─────────────────────────────────────────────────────────
+// -- Step transitions
 
-func (m Model) enterStep(s Step) (Model, tea.Cmd) {
-	m.step = s
-	var threads []gh.Thread
+func (m Model) enterBatchGroups() Model {
+	if len(m.groups) == 0 {
+		// No stale notifications — skip to done.
+		m.step = StepDone
 
-	switch s {
-	case StepOld:
-		threads = m.oldThreads
-	case StepClosedPRs:
-		threads = m.closedPRs
-	case StepReadDone:
-		threads = m.readThreads
+		return m
 	}
 
-	if len(threads) == 0 {
-		return m.advanceStep()
-	}
+	items := make([]list.Item, len(m.groups))
+	for i, g := range m.groups {
+		action := m.groupActions[i]
+		if action == ActionNone {
+			action = ActionDone // sensible default
+		}
 
-	items := make([]list.Item, len(threads))
-	for i, t := range threads {
-		items[i] = notifItem{thread: t, action: m.decisions[t.ID]}
+		m.groupActions[i] = action
+		items[i] = groupItem{group: g, action: action}
 	}
 
 	delegate := list.NewDefaultDelegate()
 	m.list = list.New(items, delegate, m.width, m.height-6)
 	m.list.SetShowHelp(false)
-	m.list.Title = stepTitle(s)
+	m.list.Title = fmt.Sprintf("Stale Notifications (%d groups)", len(m.groups))
+	m.step = StepBatchGroups
 
-	return m, nil
+	return m
 }
 
-func (m Model) advanceStep() (Model, tea.Cmd) {
-	switch m.step {
-	case StepStats:
-		return m.enterStep(StepOld)
-	case StepOld:
-		return m.enterStep(StepClosedPRs)
-	case StepClosedPRs:
-		return m.enterStep(StepReadDone)
-	default:
-		// Build pending list and go to confirm.
-		m.pending = m.buildPending()
-		m.step = StepConfirm
-		return m, nil
-	}
-}
-
-func (m Model) setCurrentAction(a Action) (Model, tea.Cmd) {
-	if item, ok := m.list.SelectedItem().(notifItem); ok {
-		m.decisions[item.thread.ID] = a
-		item.action = a
-		// Re-render the item in the list.
-		idx := m.list.Index()
-		m.list.SetItem(idx, item)
+func (m Model) setGroupAction(a Action) Model {
+	idx := m.list.Index()
+	if idx < 0 || idx >= len(m.groups) {
+		return m
 	}
 
-	var cmd tea.Cmd
-	m.list, cmd = m.list.Update(nil)
+	m.groupActions[idx] = a
 
-	return m, cmd
+	item := groupItem{group: m.groups[idx], action: a}
+	m.list.SetItem(idx, item)
+
+	return m
 }
 
 func (m Model) buildPending() []pendingAction {
 	var out []pendingAction
 
-	for id, action := range m.decisions {
+	for idx, action := range m.groupActions {
 		if action == ActionNone || action == ActionSkip {
 			continue
 		}
 
-		for _, t := range m.allThreads {
-			if t.ID == id {
-				out = append(out, pendingAction{thread: t, action: action})
-				break
-			}
+		if idx >= len(m.groups) {
+			continue
+		}
+
+		for _, t := range m.groups[idx].Threads {
+			out = append(out, pendingAction{thread: t, action: action})
 		}
 	}
 
 	return out
 }
 
-func (m Model) inListStep() bool {
-	return m.step == StepOld || m.step == StepClosedPRs || m.step == StepReadDone
-}
-
-// ── Views ────────────────────────────────────────────────────────────────────
+// -- Views
 
 func (m Model) viewStats() string {
 	var b strings.Builder
@@ -398,7 +377,7 @@ func (m Model) viewStats() string {
 	if len(m.stats) == 0 {
 		b.WriteString(Muted.Render("No notifications found.") + "\n")
 	} else {
-		header := fmt.Sprintf("%-40s %6s %6s  %-30s  %s",
+		header := fmt.Sprintf("%-40s %6s %6s  %-20s  %s",
 			"Repository", "Total", "Unread", "Top reason", "Suggestion")
 		b.WriteString(TableHeader.Render(header) + "\n")
 
@@ -410,23 +389,39 @@ func (m Model) viewStats() string {
 				sug = SuggestionStyle.Render("→ " + s.Suggestion)
 			}
 
-			line := fmt.Sprintf("%-40s %6d %6d  %-30s  %s",
+			line := fmt.Sprintf("%-40s %6d %6d  %-20s  %s",
 				truncate(s.Repo, 40), s.Total, s.Unread, topReason, sug)
 			b.WriteString(line + "\n")
 		}
 	}
 
+	staleCount := 0
+	for _, g := range m.groups {
+		staleCount += len(g.Threads)
+	}
+
 	b.WriteString("\n")
-	b.WriteString(HelpStyle.Render("press enter to start cleaning up · q to quit"))
+
+	if staleCount > 0 {
+		b.WriteString(fmt.Sprintf(
+			SuggestionStyle.Render("Found %d stale notification(s) in %d group(s) — press enter to triage"),
+			staleCount, len(m.groups)) + "\n")
+	} else {
+		b.WriteString(Muted.Render("No stale notifications found.") + "\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(HelpStyle.Render("press enter to continue · q to quit"))
 
 	return b.String()
 }
 
-func (m Model) viewList() string {
+func (m Model) viewBatchGroups() string {
 	var b strings.Builder
 	b.WriteString(m.list.View())
 	b.WriteString("\n")
-	b.WriteString(HelpStyle.Render("r=read  d=done  m=mute  s=skip  enter=next step  q=quit"))
+	b.WriteString(HelpStyle.Render(
+		"r=read  d=done  m=mute  s=skip  ↑↓=navigate  enter=review & apply  q=quit"))
 
 	return b.String()
 }
@@ -443,13 +438,26 @@ func (m Model) viewConfirm() string {
 		return b.String()
 	}
 
+	// Group pending by repo for readable display.
+	repoOrder := []string{}
+	byRepo := map[string][]pendingAction{}
+
 	for _, p := range m.pending {
-		badge := actionBadge(p.action)
-		fmt.Fprintf(&b, "  %s  %s / %s\n",
-			badge,
-			Muted.Render(p.thread.Repository.FullName),
-			p.thread.Subject.Title,
-		)
+		repo := p.thread.Repository.FullName
+		if _, ok := byRepo[repo]; !ok {
+			repoOrder = append(repoOrder, repo)
+		}
+
+		byRepo[repo] = append(byRepo[repo], p)
+	}
+
+	for _, repo := range repoOrder {
+		_, _ = fmt.Fprintf(&b, "  %s\n", Muted.Render(repo))
+
+		for _, p := range byRepo[repo] {
+			badge := actionBadge(p.action)
+			_, _ = fmt.Fprintf(&b, "    %s  %s\n", badge, p.thread.Subject.Title)
+		}
 	}
 
 	b.WriteString("\n")
@@ -467,11 +475,6 @@ func (m Model) viewApplying() string {
 	var b strings.Builder
 
 	b.WriteString(TitleStyle.Render("Applying…") + "\n\n")
-
-	for _, line := range m.progress {
-		b.WriteString(line + "\n")
-	}
-
 	fmt.Fprintf(&b, "\n  %s working…\n", m.spinner.View())
 
 	return b.String()
@@ -481,10 +484,15 @@ func (m Model) viewDone() string {
 	var b strings.Builder
 
 	b.WriteString(TitleStyle.Render("Done!") + "\n\n")
-	b.WriteString(SummaryStyle.Render(fmt.Sprintf(
-		"  Marked read: %d  |  Done: %d  |  Muted: %d",
-		m.applied.read, m.applied.done, m.applied.muted,
-	)) + "\n")
+
+	if len(m.groups) == 0 {
+		b.WriteString(Muted.Render("No stale notifications found — inbox already clean.") + "\n")
+	} else {
+		b.WriteString(SummaryStyle.Render(fmt.Sprintf(
+			"  Marked read: %d  |  Done: %d  |  Muted: %d",
+			m.applied.read, m.applied.done, m.applied.muted,
+		)) + "\n")
+	}
 
 	if len(m.applied.errs) > 0 {
 		b.WriteString(BadgeDanger.Render(fmt.Sprintf("\n  %d error(s):", len(m.applied.errs))) + "\n")
@@ -499,18 +507,33 @@ func (m Model) viewDone() string {
 	return b.String()
 }
 
-// ── Commands ─────────────────────────────────────────────────────────────────
+// -- Commands (Bubble Tea Cmds)
 
 func (m Model) loadNotifications() tea.Cmd {
 	return func() tea.Msg {
+		// Fetch notifications and viewer login in sequence (both needed before stale check).
 		threads, err := m.client.ListAll(m.filter)
+		if err != nil {
+			return loadedMsg{err: err}
+		}
+
+		viewerLogin, err := m.client.GetAuthenticatedUser()
 		if err != nil {
 			return loadedMsg{err: err}
 		}
 
 		stats := gh.ComputeStats(threads)
 
-		return loadedMsg{threads: threads, stats: stats}
+		return loadedMsg{threads: threads, stats: stats, viewerLogin: viewerLogin}
+	}
+}
+
+func (m Model) checkStale() tea.Cmd {
+	return func() tea.Msg {
+		staleThreads := gh.StaleOnly(gh.CheckStalePR(m.client, m.allThreads, m.viewerLogin))
+		groups := gh.GroupByRepoReason(staleThreads)
+
+		return staleCheckedMsg{groups: groups}
 	}
 }
 
@@ -566,20 +589,7 @@ func (m Model) applyActions() tea.Cmd {
 	}
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-func stepTitle(s Step) string {
-	switch s {
-	case StepOld:
-		return "Old Notifications"
-	case StepClosedPRs:
-		return "Closed / Merged PR Notifications"
-	case StepReadDone:
-		return "Already-read Notifications"
-	default:
-		return ""
-	}
-}
+// -- Helpers
 
 func actionBadge(a Action) string {
 	switch a {
@@ -618,47 +628,6 @@ func truncate(s string, max int) string {
 	}
 
 	return s[:max-1] + "…"
-}
-
-func filterOld(threads []gh.Thread, days int) []gh.Thread {
-	cutoff := cutoffDuration(days)
-	var out []gh.Thread
-
-	for _, t := range threads {
-		if t.UpdatedAt.Before(cutoff) {
-			out = append(out, t)
-		}
-	}
-
-	return out
-}
-
-func filterClosedPRs(threads []gh.Thread) []gh.Thread {
-	var out []gh.Thread
-
-	for _, t := range threads {
-		if t.Subject.Type == "PullRequest" && !t.Unread {
-			out = append(out, t)
-		}
-	}
-
-	return out
-}
-
-func filterRead(threads []gh.Thread) []gh.Thread {
-	var out []gh.Thread
-
-	for _, t := range threads {
-		if !t.Unread {
-			out = append(out, t)
-		}
-	}
-
-	return out
-}
-
-func cutoffDuration(days int) time.Time {
-	return time.Now().AddDate(0, 0, -days)
 }
 
 // humanAge returns a human-readable age string for t, e.g. "3d ago".
